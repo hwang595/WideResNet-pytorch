@@ -30,8 +30,7 @@ from datetime import datetime
 from wideresnet import WideResNet
 
 from pytorch_ps_mpi import MPI_PS
-import svd_comms
-import qsgd
+import codings
 
 today_datetime = datetime.now().isoformat()[:10]
 today = '2018-01-26'
@@ -192,10 +191,9 @@ def main():
         datasets.__dict__[args.dataset.upper()]('../data', train=False, transform=transform_test),
         batch_size=args.batch_size, shuffle=False, **kwargs)
 
-
     # get the number of model parameters
-    print('Number of model parameters: {}'.format(
-        sum([p.data.nelement() for p in model.parameters()])))
+    args.num_parameters = sum([p.data.nelement() for p in model.parameters()])
+    print('Number of model parameters: {}'.format(args.num_parameters))
 
     # for training on multiple GPUs.
     # Use CUDA_VISIBLE_DEVICES=0,1 to specify which GPUs to use
@@ -237,16 +235,16 @@ def main():
     if not args.qsgd:
         encode_kwargs = {'random_sample': args.svd_rescale,
                          'svd_rank': args.svd_rank, 'compress': args.compress}
-        coding = {'encode': svd_comms.encode, 'decode': svd_comms.decode}
+        code = codings.svd.SVD()
     else:
         encode_kwargs = {}
-        coding = {'encode': qsgd.encode, 'decode': qsgd.decode}
+        code = codings.qsgd.QSGD()
 
     names = [n for n, p in model.named_parameters()]
     assert len(names) == len(set(names))
     optimizer = MPI_PS(model.named_parameters(), model.parameters(), args.lr,
-                       encode_kwargs=encode_kwargs, names=names,
-                       use_mpi=args.use_mpi, cuda=args.use_cuda, **coding)
+                       code=code,
+                       use_mpi=args.use_mpi, cuda=args.use_cuda)
 
     data = []
     train_data = []
@@ -268,8 +266,8 @@ def main():
         datum = validate(val_loader, model, criterion, epoch)
         train_datum = validate(train_loader, model, criterion, epoch)
         data += [{'train_time': train_time,
-                  'whole_train_acc': train_datum['acc_test'],
-                  'whole_train_loss': train_datum['loss_test'],
+                  'whole_train_acc': train_datum['acc_train'],
+                  'whole_train_loss': train_datum['loss_train'],
                   'epoch': epoch + 1, **vars(args), **datum}]
         if epoch > 0:
             data[-1]['epoch_train_time'] = data[-1]['train_time'] - data[-2]['train_time']
@@ -282,11 +280,10 @@ def main():
 
         df = pd.DataFrame(data)
         train_df = pd.DataFrame(train_data)
-        #  whole_train = {'acc_train'}
         if True:
             time.sleep(1)
-            print('\n\nmin_train_loss', train_datum['loss_test'],
-                  train_datum['acc_test'], '\n\n')
+            print('\n\nmin_train_loss', train_datum['loss_train'],
+                  train_datum['acc_train'], '\n\n')
             time.sleep(1)
         ids = [str(getattr(args, key)) for key in
                ['layers', 'lr', 'batch_size', 'compress', 'seed', 'num_workers',
@@ -327,7 +324,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         if args.use_cuda:
             target = target.cuda(**cuda_kwargs)
             input = input.cuda(**cuda_kwargs)
-        if i > 10:
+        if i > 3:
             break
         if i > 50e3 / 1024:
             break
