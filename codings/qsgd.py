@@ -37,9 +37,9 @@ class QSGD(Coding):
             return code, data
         return code
 
-    def decode(self, code, cuda=False, **kwargs):
-        if self.scheme == 'terngrad':
-            code['norm'] = self._get_max_norm(self.codes)
+    def decode(self, code, cuda=False, codes=[], **kwargs):
+        if self.scheme == 'terngrad' and len(codes) > 0:
+            code['norm'] = self._get_max_norm(codes)
 
         v = np.zeros(code['size'])
         signs = np.array(code['signs'], dtype='int8')

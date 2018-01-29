@@ -86,6 +86,8 @@ class SVD(Coding):
             return grad
 
         u, s, v = (encode_output[key] for key in ['u', 's', 'v'])
+        if isinstance(u, (torch.Tensor, torch.cuda.FloatTensor)):
+            u, s, v = (x.cpu().numpy() for x in [u, s, v])
         grad_approx = u @ np.diag(s) @ v.T
         grad_approx = torch.Tensor(grad_approx)
         if encode_output.get('reshaped', False):
