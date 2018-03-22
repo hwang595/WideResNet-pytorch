@@ -1,9 +1,11 @@
 from __future__ import print_function
 import argparse
 import os
+import sys
 import shutil
 import time
 from tqdm import tqdm
+from pprint import pprint
 
 import torch
 import torch.nn as nn
@@ -20,18 +22,20 @@ import pandas as pd
 import numpy as np
 import random
 from warnings import warn
+from torch.multiprocessing import Process
+import random
+from functools import partial
+from datetime import datetime
 
 from wideresnet import WideResNet
-from datetime import datetime
+
+from pytorch_ps_mpi import MPI_PS, Adam, SGD
+import codings
+
 today_datetime = datetime.now().isoformat()[:10]
-today = '2017-09-12'
+today = '2018-02-27'
 if today != today_datetime:
     warn('Is today set correctly?')
-
-
-# used for logging to TensorBoard
-if False:
-    from tensorboard_logger import configure, log_value
 
 use_cuda = torch.cuda.is_available()
 parser = argparse.ArgumentParser(description='PyTorch WideResNet Training')
@@ -41,19 +45,19 @@ parser.add_argument('--epochs', default=200, type=int,
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int,
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=512, type=int,
+parser.add_argument('-b', '--batch-size', default=1024, type=int,
                     help='mini-batch size (default: 512)')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
-                    help='initial learning rate')
+                    help='initial learning rate. tuned')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
 parser.add_argument('--nesterov', default=True, type=bool, help='nesterov momentum')
 parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
                     help='weight decay (default: 5e-4)')
 parser.add_argument('--print-freq', '-p', default=10, type=int,
                     help='print frequency (default: 10)')
-parser.add_argument('--layers', default=28, type=int,
+parser.add_argument('--layers', default=10, type=int,
                     help='total number of layers (default: 28)')
-parser.add_argument('--widen-factor', default=10, type=int,
+parser.add_argument('--widen-factor', default=1, type=int,
                     help='widen factor (default: 10)')
 parser.add_argument('--droprate', default=0, type=float,
                     help='dropout probability (default: 0.0)')
@@ -65,28 +69,59 @@ parser.add_argument('--name', default='WideResNet-28-10', type=str,
                     help='name of experiment')
 parser.add_argument('--tensorboard', default=False,
                     help='Log progress to TensorBoard', action='store_true')
-parser.add_argument('--num_workers', default=1, help='Number of workers', type=int)
+parser.add_argument('--num_workers', default=1, help='Number of workers',
+                    type=int)
 parser.add_argument('--seed', default=42, help='Random seed', type=int)
+parser.add_argument('--compress', default=1,
+                    help='Boolean int: compress or not', type=int)
+parser.add_argument('--svd_rescale', default=1,
+                    help='Boolean int: compress or not', type=int)
+parser.add_argument('--svd_rank', default=0, help='Boolean int: compress or not',
+                    type=int)
+parser.add_argument('--device', default=0, help='Which GPU to use', type=int)
+parser.add_argument('--qsgd', default=0, type=int, help='Use QSGD?')
+parser.add_argument('--use_mpi', default=1, type=int, help='Use MPI?')
+parser.add_argument('--code', type=str, default='sgd')
+parser.add_argument('--scheme', type=str, default='qsgd')
+parser.add_argument('--compress-level', type=int, default=3)
 
 parser.set_defaults(augment=True)
 args = parser.parse_args()
 args.use_cuda = use_cuda
+args.compress = bool(args.compress)
+args.qsgd = bool(args.qsgd)
+args.use_mpi = bool(args.use_mpi)
+args.svd_rescale = bool(args.svd_rescale)
+print("args.compress ==", args.compress)
+print("args.use_cuda ==", args.use_cuda)
 
-def _set_visible_gpus(num_gpus, verbose=True):
+
+def _set_visible_gpus(num_gpus, device=None, verbose=True):
     gpus = list(range(torch.cuda.device_count()))
-    devices = gpus[:num_gpus]
+    if device is not None:
+        devices = [device]
+    else:
+        devices = gpus[:num_gpus]
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join([str(g) for g in devices])
     if verbose:
         print("CUDA_VISIBLE_DEVICES={}".format(os.environ["CUDA_VISIBLE_DEVICES"]))
     return devices
 
-
-device_ids = _set_visible_gpus(args.num_workers)
+#  device_ids = _set_visible_gpus(args.num_workers, random_gpu=args.random_gpu)
+device_ids = _set_visible_gpus(args.num_workers, device=args.device)
 cuda_kwargs = {'async': True}
 
-torch.manual_seed(args.seed)
-np.random.seed(args.seed)
-random.seed(args.seed)
+from mpi4py import MPI
+size = MPI.COMM_WORLD.Get_size()
+#  args.num_workers = max(args.num_workers, size)
+args.world_size = size
+args.batch_size = args.batch_size // args.world_size
+print(args.world_size, args.batch_size)
+def _set_seed(seed):
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+_set_seed(args.seed)
 
 best_prec1 = 0
 
@@ -95,13 +130,14 @@ def _mkdir(dir):
     if not os.path.isdir(dir):
         os.mkdir(dir)
     return True
-    
+
 def _write_csv(df, id=''):
     filename = f'output/{today}/{id}.csv'
     _mkdir('output')
     _mkdir(f'output/{today}')
     df.to_csv(filename)
     return True
+
 def main():
     global args, best_prec1, data
     if args.tensorboard: configure("runs/%s"%(args.name))
@@ -132,29 +168,35 @@ def main():
         normalize
         ])
 
-    kwargs = {'num_workers': args.num_workers, 'pin_memory': use_cuda}
-    assert(args.dataset == 'cifar10' or args.dataset == 'cifar100')
-    print("Creating the DataLoader...")
-    train_loader = torch.utils.data.DataLoader(
-        datasets.__dict__[args.dataset.upper()]('../data', train=True, download=True,
-                         transform=transform_train),
-        batch_size=args.batch_size, shuffle=True, **kwargs)
-    val_loader = torch.utils.data.DataLoader(
-        datasets.__dict__[args.dataset.upper()]('../data', train=False, transform=transform_test),
-        batch_size=args.batch_size, shuffle=True, **kwargs)
-
     # create model
     print("Creating the model...")
     model = WideResNet(args.layers, args.dataset == 'cifar10' and 10 or 100,
-                            args.widen_factor, dropRate=args.droprate)
+                       args.widen_factor, dropRate=args.droprate)
+
+    rank = MPI.COMM_WORLD.Get_rank()
+    args.rank = rank
+    args.seed += rank
+    _set_seed(args.seed)
+
+    print("Creating the DataLoader...")
+    kwargs = {'num_workers': args.num_workers}#, 'pin_memory': args.use_cuda}
+    assert(args.dataset == 'cifar10' or args.dataset == 'cifar100')
+    train_loader = torch.utils.data.DataLoader(
+        datasets.__dict__[args.dataset.upper()]('../data', train=True,
+                                                download=True,
+                                                transform=transform_train),
+        batch_size=args.batch_size, shuffle=True, **kwargs)
+    val_loader = torch.utils.data.DataLoader(
+        datasets.__dict__[args.dataset.upper()]('../data', train=False, transform=transform_test),
+        batch_size=args.batch_size, shuffle=False, **kwargs)
 
     # get the number of model parameters
-    print('Number of model parameters: {}'.format(
-        sum([p.data.nelement() for p in model.parameters()])))
+    args.num_parameters = sum([p.data.nelement() for p in model.parameters()])
+    print('Number of model parameters: {}'.format(args.num_parameters))
 
     # for training on multiple GPUs.
     # Use CUDA_VISIBLE_DEVICES=0,1 to specify which GPUs to use
-    if use_cuda:
+    if args.use_cuda:
         print("Moving the model to the GPU")
         model = torch.nn.DataParallel(model, device_ids=device_ids)
         model = model.cuda()
@@ -178,32 +220,102 @@ def main():
     # define loss function (criterion) and optimizer
 
     criterion = nn.CrossEntropyLoss()
-    if use_cuda:
+    if args.use_cuda:
         criterion = criterion.cuda()
-    #optimizer = torch.optim.SGD(model.parameters(), args.lr,
-    #                            momentum=args.momentum, nesterov=args.nesterov,
-    #                            weight_decay=args.weight_decay)
-    optimizer = torch.optim.ASGD(model.parameters(), args.lr)
+    #  optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                              #  momentum=args.momentum, nesterov=args.nesterov,
+                              #  weight_decay=args.weight_decay)
+    #  optimizer = torch.optim.ASGD(model.parameters(), args.lr)
+    #  from distributed_opt import MiniBatchSGD
+    #  import torch.distributed as dist
+    #  rank = np.random.choice('gloo')
+
+    # TODO: pass kwargs to code
+    print('initing MiniBatchSGD')
+    print(list(model.parameters())[6].view(-1)[:3])
+
+    if args.code == 'sgd':
+        code = codings.svd.SVD(compress=False)
+    elif args.code == 'svd':
+        print("train.py, svd_rank =", args.svd_rank)
+        code = codings.svd.SVD(random_sample=args.svd_rescale, rank=args.svd_rank,
+                               compress=args.compress)
+    elif args.code == 'qsgd':
+        code = codings.qsgd.QSGD(scheme='qsgd')
+    elif args.code == 'terngrad':
+        code = codings.qsgd.QSGD(scheme='terngrad')
+    elif args.code == 'qsvd':
+        code = codings.qsvd.QSVD(scheme=args.scheme, rank=args.svd_rank)
+    else:
+        raise ValueError('args.code not recognized')
+
+    names = [n for n, p in model.named_parameters()]
+    assert len(names) == len(set(names))
+    #  optimizer = MPI_PS(model.named_parameters(), model.parameters(), args.lr,
+                       #  code=code, optim='adam',
+                       #  use_mpi=args.use_mpi, cuda=args.use_cuda)
+
+    optimizer = SGD(model.named_parameters(), model.parameters(), args.lr,
+                    code=code, optim='sgd',
+                    use_mpi=args.use_mpi, cuda=args.use_cuda, compress_level=args.compress_level)
 
     data = []
+    train_data = []
     train_time = 0
-    for epoch in range(args.start_epoch, args.epochs):
+    for epoch in range(args.start_epoch, args.epochs + 1):
+        print(f"epoch {epoch}")
         adjust_learning_rate(optimizer, epoch+1)
 
         # train for one epoch
         start = time.time()
-        train(train_loader, model, criterion, optimizer, epoch)
+        if epoch >= 0:
+            train_d = train(train_loader, model, criterion, optimizer, epoch)
+        else:
+            train_d = []
         train_time += time.time() - start
+        train_data += [dict(datum, **vars(args)) for datum in train_d]
 
         # evaluate on validation set
+        if epoch >= args.epochs:
+            train_datum = validate(train_loader, model, criterion, epoch)
+        else:
+            train_datum = {'acc_test': np.inf, 'loss_test': np.inf}
         datum = validate(val_loader, model, criterion, epoch)
+        #  train_datum = {'acc_train': 0.1, 'loss_train': 2.3}
         data += [{'train_time': train_time,
+                  'whole_train_acc': train_datum['acc_test'],
+                  'whole_train_loss': train_datum['loss_test'],
                   'epoch': epoch + 1, **vars(args), **datum}]
+        if epoch > 0:
+            if len(data) > 1:
+                data[-1]['epoch_train_time'] = data[-1]['train_time'] - data[-2]['train_time']
+            for key in train_data[-1]:
+                values = [datum[key] for i, datum in enumerate(train_data)]
+                if 'time' in key:
+                    data[-1]["epoch_" + key] = np.sum(values)
+                else:
+                    data[-1]["epoch_" + key] = values[0]
+
         df = pd.DataFrame(data)
-        _write_csv(df, id=f'{args.num_workers}_{args.seed}')
-        pprint({k: v for k, v in data[-1].items() if k in ['train_time', 'num_workers',
-                                                           'test_loss', 'test_acc', 'epoch']})
-        prec1 = datum['test_acc']
+        train_df = pd.DataFrame(train_data)
+        if True:
+            time.sleep(1)
+            # Yes loss_test IS on train data. (look at what validate returns)
+            print('\n\nmin_train_loss', train_datum['loss_test'],
+                  optimizer.steps, '\n\n')
+            time.sleep(1)
+        ids = [str(getattr(args, key)) for key in
+               ['layers', 'lr', 'batch_size', 'compress', 'seed', 'num_workers',
+                'svd_rank', 'svd_rescale', 'use_mpi', 'qsgd', 'world_size',
+                'rank', 'code', 'scheme']]
+        _write_csv(df, id=f'-'.join(ids))
+        _write_csv(train_df, id=f'-'.join(ids) + '_train')
+        pprint({k: v for k, v in data[-1].items()
+                if k in ['svd_rank', 'svd_rescale', 'qsgd', 'compress']})
+        pprint({k: v for k, v in data[-1].items()
+                if k in ['train_time', 'num_workers', 'loss_test',
+                         'acc_test', 'epoch', 'compress', 'svd_rank', 'qsgd'] or 'time' in k})
+        prec1 = datum['acc_test']
 
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
@@ -213,7 +325,7 @@ def main():
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
         }, is_best)
-    print('Best accuracy: ', best_prec1)
+        print('Best accuracy: ', best_prec1)
 
 def train(train_loader, model, criterion, optimizer, epoch):
     """Train for one epoch on the training set"""
@@ -225,18 +337,27 @@ def train(train_loader, model, criterion, optimizer, epoch):
     model.train()
 
     end = time.time()
-    pbar = tqdm(enumerate(train_loader))
-    start = time.time()
+    pbar = tqdm(enumerate(train_loader), leave=True)
+    comm_data = []
     for i, (input, target) in pbar:
-        if use_cuda:
+        start = time.time()
+        loop_start = time.time()
+        if args.use_cuda:
             target = target.cuda(**cuda_kwargs)
             input = input.cuda(**cuda_kwargs)
+        if i > 50e3 / 1024:
+            break
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
+        loss_datum = {'example_to_gpu': time.time() - start}
 
         # compute output
+        start = time.time()
         output = model(input_var)
         loss = criterion(output, target_var)
+        loss_datum['grad_forward_pass'] = time.time() - start
+        if loss.data.cpu().numpy().min() > 100:
+            break
 
         # measure accuracy and record loss
         prec1 = accuracy(output.data, target, topk=(1,))[0]
@@ -244,20 +365,34 @@ def train(train_loader, model, criterion, optimizer, epoch):
         top1.update(prec1[0], input.size(0))
 
         # compute gradient and do SGD step
+        loss_start = time.time()
         optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+        loss_datum['grad_compute_time'] = time.time() - loss_start
 
+        r = optimizer.step()
+        if r is not None:
+            _, comm_datum = r
+        else:
+            comm_datum = {}
         # measure elapsed time
+        loss_datum['step_time'] = time.time() - loop_start
+        pprint({**comm_datum, **loss_datum})
+        comm_data += [{'loss_train_avg': losses.avg, 'loss_train': losses.val,
+                       'acc_train_avg': top1.avg,   'acc_train': top1.val,
+                       **comm_datum, **loss_datum}]
+
         batch_time.update(time.time() - end)
         end = time.time()
 
         p = 100 * i / len(train_loader)
         pbar.set_description(f'loss={losses.avg:.3f}, acc={top1.avg:.3f} {p:.1f}%')
+
     # log to TensorBoard
     if args.tensorboard:
         log_value('train_loss', losses.avg, epoch)
         log_value('train_acc', top1.avg, epoch)
+    return comm_data
 
 def validate(val_loader, model, criterion, epoch):
     """Perform validation on the validation set"""
@@ -269,10 +404,11 @@ def validate(val_loader, model, criterion, epoch):
     model.eval()
 
     end = time.time()
-    pbar = tqdm(enumerate(val_loader))
+    pbar = tqdm(enumerate(val_loader), leave=True)
     for i, (input, target) in pbar:
-        target = target.cuda(**cuda_kwargs)
-        input = input.cuda(**cuda_kwargs)
+        if args.use_cuda:
+            target = target.cuda(**cuda_kwargs)
+            input = input.cuda(**cuda_kwargs)
         input_var = torch.autograd.Variable(input, volatile=True)
         target_var = torch.autograd.Variable(target, volatile=True)
 
@@ -297,8 +433,8 @@ def validate(val_loader, model, criterion, epoch):
     if args.tensorboard:
         log_value('val_loss', losses.avg, epoch)
         log_value('val_acc', top1.avg, epoch)
-    return {'test_loss': losses.avg,
-            'test_acc': top1.avg}
+    return {'loss_test': losses.avg,
+            'acc_test': top1.avg}
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -331,7 +467,10 @@ class AverageMeter(object):
 
 def adjust_learning_rate(optimizer, epoch):
     """Sets the learning rate to the initial LR divided by 5 at 60th, 120th and 160th epochs"""
-    lr = args.lr * ((0.2 ** int(epoch >= 60)) * (0.2 ** int(epoch >= 120))* (0.2 ** int(epoch >= 160)))
+    #  lr = args.lr * ((0.2 ** int(epoch >= 60)) * (0.2 ** int(epoch >= 120))* (0.2 ** int(epoch >= 160)))
+    lr = args.lr
+    if epoch % 3 == 0 and epoch > 1:
+        lr = args.lr * 0.97**(epoch / 3)
     # log to TensorBoard
     if args.tensorboard:
         log_value('learning_rate', lr, epoch)
@@ -353,5 +492,7 @@ def accuracy(output, target, topk=(1,)):
         res.append(correct_k.mul_(1 / batch_size))
     return res
 
+
 if __name__ == '__main__':
+    print("In train.py")
     main()
